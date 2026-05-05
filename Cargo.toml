@@ -1,8 +1,8 @@
 [package]
 name = "cargo-vibe"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.95"
 description = "Unified CLI orchestrator for the Rust AI vibe coding toolchain — runs cargo-context, diff-risk, cargo-impact, and spec-drift as a single workflow"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/asmuelle/cargo-vibe"
