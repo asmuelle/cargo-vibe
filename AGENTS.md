@@ -95,7 +95,7 @@ explicitly. Short `fix:` / `chore:` one-liners are fine for tiny changes.
 
 ## Where to file things
 
-- Bugs / feature requests: https://github.com/asmuelle/cargo-vibe/issues
+- Bugs / feature requests: https://github.com/asmuelle/cargo-vibecode/issues
 - Interop with other tools: same org; each tool has its own repo under
   `github.com/asmuelle/`
 

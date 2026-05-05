@@ -1,7 +1,7 @@
 # cargo-vibe
 
-[![CI](https://github.com/asmuelle/cargo-vibe/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asmuelle/cargo-vibe/actions/workflows/ci.yml)
-[![Release](https://github.com/asmuelle/cargo-vibe/actions/workflows/release.yml/badge.svg)](https://github.com/asmuelle/cargo-vibe/actions/workflows/release.yml)
+[![CI](https://github.com/asmuelle/cargo-vibecode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asmuelle/cargo-vibecode/actions/workflows/ci.yml)
+[![Release](https://github.com/asmuelle/cargo-vibecode/actions/workflows/release.yml/badge.svg)](https://github.com/asmuelle/cargo-vibecode/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust edition](https://img.shields.io/badge/rust-2024%20%7C%201.95%2B-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
