@@ -1,5 +1,7 @@
 # cargo-vibe
 
+[![CI](https://github.com/asmuelle/cargo-vibe/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asmuelle/cargo-vibe/actions/workflows/ci.yml)
+
 Unified CLI orchestrator for the Rust AI vibe coding toolchain.
 
 ```
