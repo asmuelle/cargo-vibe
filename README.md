@@ -1,11 +1,11 @@
-# cargo-vibe
+# cargo-vibecode
 
 [![CI](https://github.com/asmuelle/cargo-vibecode/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/asmuelle/cargo-vibecode/actions/workflows/ci.yml)
 [![Release](https://github.com/asmuelle/cargo-vibecode/actions/workflows/release.yml/badge.svg)](https://github.com/asmuelle/cargo-vibecode/actions/workflows/release.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust edition](https://img.shields.io/badge/rust-2024%20%7C%201.95%2B-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/index.html)
 
-Unified CLI orchestrator for the Rust AI vibe coding toolchain.
+Repository for the `cargo-vibe` CLI orchestrator. The installed Cargo subcommand remains `cargo vibe`.
 
 ```
 cargo vibe check ──► runs diff-risk + cargo-impact + spec-drift, aggregates results
@@ -25,7 +25,7 @@ AI-assisted Rust development has four failure modes:
 3. **Documentation rots silently** — README says `fn old()` but code has `fn new()`
 4. **Context quality determines output quality** — dumping all files wastes tokens and attention
 
-Four tools solve these individually. `cargo-vibe` orchestrates them into a single workflow.
+Four tools solve these individually. `cargo-vibecode` packages the `cargo-vibe` orchestrator that runs them as a single workflow.
 
 ## Installation
 
@@ -205,22 +205,23 @@ cargo vibe check --since HEAD --strict || exit 1
 ## Architecture
 
 ```
-cargo-vibe (orchestrator)
-  ├── ai-tools-core (shared types)
-  │     ├── finding    — Finding, Severity, Confidence, Location
-  │     ├── sarif      — SARIF v2.1.0 renderer
-  │     ├── scrub      — Secret scrubbing pipeline
-  │     ├── git_utils  — diff, blame, changed files
-  │     ├── cargo_utils— metadata, workspace discovery
-  │     └── config     — .cargo-vibe.toml parser
-  │
-  ├── diff-risk ─────── risk scoring (regex detectors + custom DSL)
-  ├── cargo-impact ──── blast-radius analysis (syn + rust-analyzer)
-  ├── spec-drift ────── spec coherence (docs/examples/tests/CI)
-  └── cargo-context ─── context assembly (token-budgeted packs)
+cargo-vibecode
+└── cargo-vibe (orchestrator)
+    ├── ai-tools-core (shared types)
+    │     ├── finding    — Finding, Severity, Confidence, Location
+    │     ├── sarif      — SARIF v2.1.0 renderer
+    │     ├── scrub      — Secret scrubbing pipeline
+    │     ├── git_utils  — diff, blame, changed files
+    │     ├── cargo_utils— metadata, workspace discovery
+    │     └── config     — .cargo-vibe.toml parser
+    │
+    ├── diff-risk ─────── risk scoring (regex detectors + custom DSL)
+    ├── cargo-impact ──── blast-radius analysis (syn + rust-analyzer)
+    ├── spec-drift ────── spec coherence (docs/examples/tests/CI)
+    └── cargo-context ─── context assembly (token-budgeted packs)
 ```
 
-Each tool is independently usable. `cargo-vibe` adds orchestration, feedback loops, and unified reporting.
+Each tool is independently usable. `cargo-vibecode` adds orchestration, feedback loops, and unified reporting through the `cargo-vibe` CLI.
 
 ## Exit Codes
 
