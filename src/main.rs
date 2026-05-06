@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use std::process::{Command, ExitCode, Stdio};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Output, Stdio};
 
 mod orchestrator;
 mod report;
@@ -105,9 +106,9 @@ enum Commands {
         /// Maximum fix attempts.
         #[arg(long, default_value = "3")]
         max_attempts: usize,
-        /// Risk threshold for auto-rejection.
-        #[arg(long, default_value = "7.0")]
-        risk_threshold: f32,
+        /// Risk threshold for auto-rejection (default: config or 7.0).
+        #[arg(long)]
+        risk_threshold: Option<f32>,
         /// Git ref to base the fix on.
         #[arg(long, default_value = "HEAD")]
         since: String,
@@ -115,30 +116,53 @@ enum Commands {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = parse_cli();
 
-    // Load project config if available
-    let config = ai_tools_core::config::load_project_config(&cli.root);
+    let config = match load_config(&cli.root, cli.config.as_deref()) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("cargo-vibe: {e:#}");
+            return ExitCode::from(2);
+        }
+    };
 
     let result = match cli.command {
-        Commands::Check { format, strict, since } => {
-            run_check(&cli.root, &format, strict, &since, config.as_ref())
-        }
-        Commands::Risk { since, threshold, format } => {
-            run_risk(&cli.root, &since, threshold, &format, config.as_ref())
-        }
-        Commands::Impact { since, test, format } => {
-            run_impact(&cli.root, &since, test, &format, config.as_ref())
-        }
+        Commands::Check {
+            format,
+            strict,
+            since,
+        } => run_check(&cli.root, &format, strict, &since, config.as_ref()),
+        Commands::Risk {
+            since,
+            threshold,
+            format,
+        } => run_risk(&cli.root, &since, threshold, &format, config.as_ref()),
+        Commands::Impact {
+            since,
+            test,
+            format,
+        } => run_impact(&cli.root, &since, test, &format, config.as_ref()),
         Commands::Drift { diff, format, deny } => {
             run_drift(&cli.root, diff.as_deref(), &format, &deny, config.as_ref())
         }
-        Commands::Context { preset, budget, stdin } => {
-            run_context(&cli.root, &preset, budget, stdin, config.as_ref())
-        }
-        Commands::Fix { prompt, max_attempts, risk_threshold, since } => {
-            run_fix(&cli.root, &prompt, max_attempts, risk_threshold, &since, config.as_ref())
-        }
+        Commands::Context {
+            preset,
+            budget,
+            stdin,
+        } => run_context(&cli.root, &preset, budget, stdin, config.as_ref()),
+        Commands::Fix {
+            prompt,
+            max_attempts,
+            risk_threshold,
+            since,
+        } => run_fix(
+            &cli.root,
+            &prompt,
+            max_attempts,
+            risk_threshold,
+            &since,
+            config.as_ref(),
+        ),
     };
 
     match result {
@@ -151,7 +175,7 @@ fn main() -> ExitCode {
 }
 
 fn run_check(
-    root: &std::path::Path,
+    root: &Path,
     format: &str,
     strict: bool,
     since: &str,
@@ -164,27 +188,40 @@ fn run_check(
 
     eprintln!("cargo-vibe: running health check against {since}...");
     let mut all_findings: Vec<ai_tools_core::finding::Finding> = Vec::new();
+    let mut risk_failed = false;
 
     // 1. Run diff-risk
     eprintln!("  [1/3] diff-risk...");
-    if let Some(diff_output) = ai_tools_core::git_utils::unified_diff(root, since) {
+    let diff_risk_config = config.map(|c| &c.diff_risk);
+    if !tool_enabled(diff_risk_config) {
+        eprintln!("  diff-risk: disabled by config, skipped");
+    } else if let Some(diff_output) = ai_tools_core::git_utils::unified_diff(root, since) {
         let tmp = std::env::temp_dir().join("cargo-vibe-diff.txt");
         std::fs::write(&tmp, &diff_output)?;
-        let risk_output = Command::new("diff-risk")
-            .args(["--threshold", &risk_threshold.to_string()])
-            .stdin(Stdio::from(std::fs::File::open(&tmp)?))
-            .output()
-            .context("running diff-risk — is it installed? (cargo install diff-risk)")?;
 
-        let risk_ok = risk_output.status.success();
-        let risk_text = String::from_utf8_lossy(&risk_output.stdout);
-        if !risk_ok {
-            eprintln!("  diff-risk: FAILED (threshold {risk_threshold} exceeded)");
+        let mut cmd = Command::new("diff-risk");
+        cmd.args(["--threshold", &risk_threshold.to_string()])
+            .args(tool_extra_args(diff_risk_config))
+            .stdin(Stdio::from(std::fs::File::open(&tmp)?));
+
+        if let Some(risk_output) = output_or_skip_missing(&mut cmd, "diff-risk")? {
+            let risk_ok = risk_output.status.success();
+            let risk_text = String::from_utf8_lossy(&risk_output.stdout);
+            let risk_err = String::from_utf8_lossy(&risk_output.stderr);
+            if !risk_err.trim().is_empty() {
+                eprintln!("{risk_err}");
+            }
+            if !risk_ok {
+                risk_failed = true;
+                eprintln!("  diff-risk: FAILED (threshold {risk_threshold} exceeded)");
+            } else {
+                eprintln!("  diff-risk: passed");
+            }
+            if !risk_text.trim().is_empty() {
+                all_findings.extend(parse_findings_from_text(&risk_text, "diff-risk"));
+            }
         } else {
-            eprintln!("  diff-risk: passed");
-        }
-        if !risk_text.trim().is_empty() {
-            all_findings.extend(parse_findings_from_text(&risk_text, "diff-risk"));
+            eprintln!("  diff-risk: not installed, skipped");
         }
     } else {
         eprintln!("  diff-risk: no diff available, skipped");
@@ -192,36 +229,61 @@ fn run_check(
 
     // 2. Run cargo-impact
     eprintln!("  [2/3] cargo-impact...");
-    let impact_output = Command::new("cargo-impact")
-        .args(["--since", since, "--format", "json", "--confidence-min", "0.5"])
-        .current_dir(root)
-        .output()
-        .context("running cargo-impact — is it installed?")?;
-
-    let impact_text = String::from_utf8_lossy(&impact_output.stdout);
-    if impact_output.status.success() {
-        let findings = parse_impact_json(&impact_text);
-        let count = findings.len();
-        all_findings.extend(findings);
-        eprintln!("  cargo-impact: {count} finding(s)");
+    let cargo_impact_config = config.map(|c| &c.cargo_impact);
+    if !tool_enabled(cargo_impact_config) {
+        eprintln!("  cargo-impact: disabled by config, skipped");
     } else {
-        eprintln!("  cargo-impact: FAILED");
+        let cargo_impact_extra_args = tool_extra_args(cargo_impact_config);
+        let mut cmd = Command::new("cargo-impact");
+        cmd.args(["--since", since, "--format", "json"]);
+        if !has_flag(cargo_impact_extra_args, "--confidence-min") {
+            cmd.args(["--confidence-min", "0.5"]);
+        }
+        cmd.args(cargo_impact_extra_args).current_dir(root);
+
+        if let Some(impact_output) = output_or_skip_missing(&mut cmd, "cargo-impact")? {
+            let impact_text = String::from_utf8_lossy(&impact_output.stdout);
+            if !impact_output.stderr.is_empty() {
+                eprintln!("{}", String::from_utf8_lossy(&impact_output.stderr));
+            }
+            let findings = parse_impact_json(&impact_text);
+            let count = findings.len();
+            if impact_output.status.success() {
+                eprintln!("  cargo-impact: {count} finding(s)");
+            } else {
+                eprintln!("  cargo-impact: FAILED ({count} parsed finding(s))");
+            }
+            all_findings.extend(findings);
+        } else {
+            eprintln!("  cargo-impact: not installed, skipped");
+        }
     }
 
     // 3. Run spec-drift
     eprintln!("  [3/3] spec-drift...");
-    let mut drift_cmd = Command::new("spec-drift");
-    drift_cmd.args(["--format", "json"]).current_dir(root);
-    if let Some(_diff_ref) = None::<&str> {
-        // Only add --diff if we have a diff reference
-    }
-    let drift_output = drift_cmd.output().context("running spec-drift — is it installed?")?;
+    let spec_drift_config = config.map(|c| &c.spec_drift);
+    if !tool_enabled(spec_drift_config) {
+        eprintln!("  spec-drift: disabled by config, skipped");
+    } else {
+        let mut drift_cmd = Command::new("spec-drift");
+        drift_cmd
+            .args(["--format", "json", "--diff", since])
+            .args(tool_extra_args(spec_drift_config))
+            .current_dir(root);
 
-    let drift_text = String::from_utf8_lossy(&drift_output.stdout);
-    let drift_findings = parse_drift_json(&drift_text);
-    let drift_count = drift_findings.len();
-    all_findings.extend(drift_findings);
-    eprintln!("  spec-drift: {drift_count} divergence(s)");
+        if let Some(drift_output) = output_or_skip_missing(&mut drift_cmd, "spec-drift")? {
+            let drift_text = String::from_utf8_lossy(&drift_output.stdout);
+            if !drift_output.stderr.is_empty() {
+                eprintln!("{}", String::from_utf8_lossy(&drift_output.stderr));
+            }
+            let drift_findings = parse_drift_json(&drift_text);
+            let drift_count = drift_findings.len();
+            all_findings.extend(drift_findings);
+            eprintln!("  spec-drift: {drift_count} divergence(s)");
+        } else {
+            eprintln!("  spec-drift: not installed, skipped");
+        }
+    }
 
     // Render results
     let total = all_findings.len();
@@ -259,7 +321,7 @@ fn run_check(
         }
     }
 
-    if strict && (critical > 0 || high > 0) {
+    if strict && (risk_failed || critical > 0 || high > 0) {
         Ok(ExitCode::from(1))
     } else {
         Ok(ExitCode::SUCCESS)
@@ -267,7 +329,7 @@ fn run_check(
 }
 
 fn run_risk(
-    root: &std::path::Path,
+    root: &Path,
     since: &str,
     threshold: Option<f32>,
     _format: &str,
@@ -280,6 +342,12 @@ fn run_risk(
             .unwrap_or(7.0)
     });
 
+    let diff_risk_config = config.map(|c| &c.diff_risk);
+    if !tool_enabled(diff_risk_config) {
+        eprintln!("diff-risk: disabled by config, skipped");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let diff = ai_tools_core::git_utils::unified_diff(root, since)
         .context("no git diff available — is this a git repository?")?;
 
@@ -288,6 +356,7 @@ fn run_risk(
 
     let risk_output = Command::new("diff-risk")
         .args(["--threshold", &t.to_string()])
+        .args(tool_extra_args(diff_risk_config))
         .stdin(Stdio::from(std::fs::File::open(&tmp)?))
         .output()
         .context("running diff-risk — is it installed? (cargo install diff-risk)")?;
@@ -307,12 +376,18 @@ fn run_risk(
 }
 
 fn run_impact(
-    root: &std::path::Path,
+    root: &Path,
     since: &str,
     test: bool,
     format: &str,
-    _config: Option<&ai_tools_core::config::VibeConfig>,
+    config: Option<&ai_tools_core::config::VibeConfig>,
 ) -> Result<ExitCode> {
+    let cargo_impact_config = config.map(|c| &c.cargo_impact);
+    if !tool_enabled(cargo_impact_config) {
+        eprintln!("cargo-impact: disabled by config, skipped");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut cmd = Command::new("cargo-impact");
     cmd.args(["--since", since]);
     if test {
@@ -320,9 +395,12 @@ fn run_impact(
     } else {
         cmd.args(["--format", format]);
     }
+    cmd.args(tool_extra_args(cargo_impact_config));
     cmd.current_dir(root);
 
-    let output = cmd.output().context("running cargo-impact — is it installed?")?;
+    let output = cmd
+        .output()
+        .context("running cargo-impact — is it installed?")?;
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.stderr.is_empty() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
@@ -336,20 +414,29 @@ fn run_impact(
 }
 
 fn run_drift(
-    root: &std::path::Path,
+    root: &Path,
     diff: Option<&str>,
     format: &str,
     deny: &str,
-    _config: Option<&ai_tools_core::config::VibeConfig>,
+    config: Option<&ai_tools_core::config::VibeConfig>,
 ) -> Result<ExitCode> {
+    let spec_drift_config = config.map(|c| &c.spec_drift);
+    if !tool_enabled(spec_drift_config) {
+        eprintln!("spec-drift: disabled by config, skipped");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut cmd = Command::new("spec-drift");
     cmd.args(["--format", format]).args(["--deny", deny]);
     if let Some(d) = diff {
         cmd.args(["--diff", d]);
     }
+    cmd.args(tool_extra_args(spec_drift_config));
     cmd.current_dir(root);
 
-    let output = cmd.output().context("running spec-drift — is it installed?")?;
+    let output = cmd
+        .output()
+        .context("running spec-drift — is it installed?")?;
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.stderr.is_empty() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
@@ -363,39 +450,74 @@ fn run_drift(
 }
 
 fn run_context(
-    root: &std::path::Path,
+    root: &Path,
     preset: &str,
     budget: Option<usize>,
     stdin: bool,
-    _config: Option<&ai_tools_core::config::VibeConfig>,
+    config: Option<&ai_tools_core::config::VibeConfig>,
 ) -> Result<ExitCode> {
+    let cargo_context_config = config.map(|c| &c.cargo_context);
+    if !tool_enabled(cargo_context_config) {
+        eprintln!("cargo-context: disabled by config, skipped");
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let mut cmd = Command::new("cargo-context");
     cmd.args(["--preset", preset]);
-    if let Some(b) = budget {
+    if let Some(b) = budget.or_else(|| config.and_then(|c| c.vibe.token_budget)) {
         cmd.args(["--max-tokens", &b.to_string()]);
     }
-    if stdin {
-        cmd.arg("--stdin");
-    }
+    cmd.args(tool_extra_args(cargo_context_config));
     cmd.current_dir(root);
 
-    let output = cmd.output().context("running cargo-context — is it installed?")?;
+    let output = if stdin {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("running cargo-context — is it installed?")?;
+        if let Some(mut child_stdin) = child.stdin.take() {
+            match child_stdin.write_all(input.as_bytes()) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        child.wait_with_output()?
+    } else {
+        cmd.stdin(Stdio::null())
+            .output()
+            .context("running cargo-context — is it installed?")?
+    };
     print!("{}", String::from_utf8_lossy(&output.stdout));
     if !output.stderr.is_empty() {
         eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     }
 
-    Ok(ExitCode::SUCCESS)
+    if output.status.success() {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
 
 fn run_fix(
-    root: &std::path::Path,
+    root: &Path,
     prompt: &str,
     max_attempts: usize,
-    risk_threshold: f32,
+    risk_threshold: Option<f32>,
     since: &str,
-    _config: Option<&ai_tools_core::config::VibeConfig>,
+    config: Option<&ai_tools_core::config::VibeConfig>,
 ) -> Result<ExitCode> {
+    let risk_threshold = risk_threshold.unwrap_or_else(|| {
+        config
+            .and_then(|c| c.diff_risk.threshold)
+            .or(config.and_then(|c| c.vibe.threshold))
+            .unwrap_or(7.0)
+    });
     let mut fix_loop = FixLoop::new(root, prompt, max_attempts, risk_threshold, since);
 
     eprintln!("cargo-vibe: starting fix loop with {max_attempts} max attempts...");
@@ -422,6 +544,55 @@ fn run_fix(
 
 // ---- Helpers ----
 
+fn parse_cli() -> Cli {
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("vibe") {
+        args.remove(1);
+    }
+    Cli::parse_from(args)
+}
+
+fn load_config(
+    root: &Path,
+    config_path: Option<&Path>,
+) -> Result<Option<ai_tools_core::config::VibeConfig>> {
+    match config_path {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read config {}", path.display()))?;
+            let config = toml::from_str(&contents)
+                .with_context(|| format!("failed to parse config {}", path.display()))?;
+            Ok(Some(config))
+        }
+        None => Ok(ai_tools_core::config::load_project_config(root)),
+    }
+}
+
+fn tool_enabled(config: Option<&ai_tools_core::config::VibeToolConfig>) -> bool {
+    config.and_then(|c| c.enabled).unwrap_or(true)
+}
+
+fn tool_extra_args(config: Option<&ai_tools_core::config::VibeToolConfig>) -> &[String] {
+    config.map(|c| c.extra_args.as_slice()).unwrap_or(&[])
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| {
+        arg == flag
+            || arg
+                .strip_prefix(flag)
+                .is_some_and(|rest| rest.starts_with('='))
+    })
+}
+
+fn output_or_skip_missing(cmd: &mut Command, tool: &str) -> Result<Option<Output>> {
+    match cmd.output() {
+        Ok(output) => Ok(Some(output)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("running {tool}")),
+    }
+}
+
 fn parse_findings_from_text(text: &str, tool: &str) -> Vec<ai_tools_core::finding::Finding> {
     let mut findings = Vec::new();
     for line in text.lines() {
@@ -429,42 +600,113 @@ fn parse_findings_from_text(text: &str, tool: &str) -> Vec<ai_tools_core::findin
         if line.is_empty() || line.starts_with('#') || line.starts_with("diff-risk") {
             continue;
         }
-        // Try to parse lines like: "  🚨 [api_contract] src/lib.rs:42  Public API changed"
-        if let Some(rest) = line
-            .trim_start_matches(|c: char| c.is_whitespace() || "🚨⚠️🟡🔵✅🔥".contains(c))
-            .strip_prefix('[')
+        let (severity, rest) = split_marker(line);
+        if rest.starts_with("DIFF RISK ASSESSMENT") || rest == "No risky patterns detected." {
+            continue;
+        }
+        if let Some(finding) = parse_bracketed_finding(rest, severity, tool)
+            .or_else(|| parse_diff_risk_finding(rest, severity, tool))
         {
-            if let Some(rule_end) = rest.find(']') {
-                let _rule = &rest[..rule_end];
-                let after = rest[rule_end + 1..].trim();
-                if let Some(file_end) = after.find(|c: char| c == ':' || c.is_whitespace()) {
-                    let file = &after[..file_end];
-                    let rest_after_file = after[file_end..].trim();
-                    let line_num: u32 = rest_after_file
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect::<String>()
-                        .parse()
-                        .unwrap_or(1);
-                    let msg = rest_after_file
-                        .trim_start_matches(|c: char| c.is_ascii_digit())
-                        .trim()
-                        .to_string();
-
-                    let finding = ai_tools_core::finding::Finding::new(
-                        ai_tools_core::finding::RuleId::Other,
-                        ai_tools_core::finding::Severity::Medium,
-                        ai_tools_core::finding::Confidence::Heuristic,
-                        ai_tools_core::finding::Location::new(file, line_num),
-                        msg,
-                    )
-                    .with_tool(tool);
-                    findings.push(finding);
-                }
-            }
+            findings.push(finding);
         }
     }
     findings
+}
+
+fn split_marker(line: &str) -> (ai_tools_core::finding::Severity, &str) {
+    let trimmed = line.trim_start();
+    for (marker, severity) in [
+        ("🚨", ai_tools_core::finding::Severity::Critical),
+        ("⚠️", ai_tools_core::finding::Severity::High),
+        ("⚠", ai_tools_core::finding::Severity::High),
+        ("🟡", ai_tools_core::finding::Severity::Medium),
+        ("✅", ai_tools_core::finding::Severity::Low),
+        ("🔵", ai_tools_core::finding::Severity::Low),
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            return (severity, rest.trim());
+        }
+    }
+    (ai_tools_core::finding::Severity::Medium, trimmed)
+}
+
+fn parse_bracketed_finding(
+    text: &str,
+    severity: ai_tools_core::finding::Severity,
+    tool: &str,
+) -> Option<ai_tools_core::finding::Finding> {
+    let rest = text.strip_prefix('[')?;
+    let rule_end = rest.find(']')?;
+    let rule = rule_from_id(&rest[..rule_end]);
+    let after = rest[rule_end + 1..].trim();
+    let (file, line_num, msg) = parse_location_and_message(after);
+    Some(
+        ai_tools_core::finding::Finding::new(
+            rule,
+            severity,
+            ai_tools_core::finding::Confidence::Heuristic,
+            ai_tools_core::finding::Location::new(file, line_num),
+            msg,
+        )
+        .with_tool(tool),
+    )
+}
+
+fn parse_diff_risk_finding(
+    text: &str,
+    severity: ai_tools_core::finding::Severity,
+    tool: &str,
+) -> Option<ai_tools_core::finding::Finding> {
+    let (header, msg) = text.split_once(" — ")?;
+    let (category, location) = header.split_once(": ")?;
+    let (file, line_num) = parse_location(location);
+    Some(
+        ai_tools_core::finding::Finding::new(
+            rule_from_diff_risk_label(category),
+            severity,
+            ai_tools_core::finding::Confidence::Heuristic,
+            ai_tools_core::finding::Location::new(file, line_num),
+            msg.trim().to_string(),
+        )
+        .with_tool(tool),
+    )
+}
+
+fn parse_location_and_message(text: &str) -> (&str, u32, String) {
+    let (location, msg) = text.split_once("  ").unwrap_or((text, ""));
+    let (file, line_num) = parse_location(location.trim());
+    (file, line_num, msg.trim().to_string())
+}
+
+fn parse_location(location: &str) -> (&str, u32) {
+    if let Some((file, line)) = location.rsplit_once(':')
+        && let Ok(line_num) = line.parse::<u32>()
+    {
+        return (file, line_num);
+    }
+    (location, 1)
+}
+
+fn rule_from_diff_risk_label(label: &str) -> ai_tools_core::finding::RuleId {
+    match label {
+        "API Contract Change" => ai_tools_core::finding::RuleId::ApiContract,
+        "Async Boundary Change" => ai_tools_core::finding::RuleId::AsyncBoundary,
+        "Serde Schema Drift" => ai_tools_core::finding::RuleId::SerdeDrift,
+        "Auth / Permission Gate" => ai_tools_core::finding::RuleId::AuthGate,
+        "Concurrency / Memory Safety" => ai_tools_core::finding::RuleId::Concurrency,
+        _ => ai_tools_core::finding::RuleId::Other,
+    }
+}
+
+fn rule_from_id(id: &str) -> ai_tools_core::finding::RuleId {
+    match id {
+        "api_contract" => ai_tools_core::finding::RuleId::ApiContract,
+        "async_boundary" => ai_tools_core::finding::RuleId::AsyncBoundary,
+        "serde_drift" => ai_tools_core::finding::RuleId::SerdeDrift,
+        "auth_gate" => ai_tools_core::finding::RuleId::AuthGate,
+        "concurrency" => ai_tools_core::finding::RuleId::Concurrency,
+        _ => ai_tools_core::finding::RuleId::Other,
+    }
 }
 
 fn parse_impact_json(text: &str) -> Vec<ai_tools_core::finding::Finding> {
@@ -581,4 +823,42 @@ fn parse_drift_json(text: &str) -> Vec<ai_tools_core::finding::Finding> {
             .with_tool("spec-drift")
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_tools_core::finding::{RuleId, Severity};
+
+    #[test]
+    fn parses_diff_risk_human_output_without_banner() {
+        let text = "\
+🚨 DIFF RISK ASSESSMENT: [SCORE: 9.0/10.0 — CRITICAL RISK]
+
+  🚨 Auth / Permission Gate: src/auth.rs:42 — auth check removed
+  ⚠️ API Contract Change: src/lib.rs:7 — public function signature changed
+";
+
+        let findings = parse_findings_from_text(text, "diff-risk");
+
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].rule, RuleId::AuthGate);
+        assert_eq!(findings[0].severity, Severity::Critical);
+        assert_eq!(findings[0].location.file, PathBuf::from("src/auth.rs"));
+        assert_eq!(findings[0].location.line, 42);
+        assert_eq!(findings[1].rule, RuleId::ApiContract);
+        assert_eq!(findings[1].severity, Severity::High);
+    }
+
+    #[test]
+    fn parses_legacy_bracketed_diff_risk_output() {
+        let text = "  🟡 [serde_drift] src/model.rs:12  serde field renamed";
+
+        let findings = parse_findings_from_text(text, "diff-risk");
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule, RuleId::SerdeDrift);
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].message, "serde field renamed");
+    }
 }

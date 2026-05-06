@@ -79,7 +79,7 @@ impl FixLoop {
                         eprintln!("      No changes detected — nothing to check.");
                         true
                     } else {
-                        self.check_risk(attempt)
+                        self.check_risk(attempt)?
                     }
                 }
                 None => {
@@ -89,7 +89,9 @@ impl FixLoop {
             };
 
             if !risk_passed {
-                eprintln!("      Risk threshold exceeded. The LLM should generate a safer alternative.");
+                eprintln!(
+                    "      Risk threshold exceeded. The LLM should generate a safer alternative."
+                );
                 if attempt < self.max_attempts {
                     eprintln!("      Feed this back to the LLM and try again.");
                     continue;
@@ -135,28 +137,24 @@ impl FixLoop {
             .output();
 
         match output {
-            Ok(out) if out.status.success() => {
-                Ok(String::from_utf8_lossy(&out.stdout).to_string())
-            }
+            Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).to_string()),
             _ => {
                 // Fallback: build minimal context manually
                 let mut ctx = String::new();
                 ctx.push_str("# Project Context\n\n");
 
-                if let Some(diff) =
-                    ai_tools_core::git_utils::unified_diff(&self.root, &self.since)
+                if let Some(diff) = ai_tools_core::git_utils::unified_diff(&self.root, &self.since)
+                    && !diff.trim().is_empty()
                 {
-                    if !diff.trim().is_empty() {
-                        ctx.push_str("## Recent Changes\n\n```diff\n");
-                        // Truncate to reasonable size
-                        let diff = if diff.len() > 4000 {
-                            format!("{}...\n(truncated)", &diff[..4000])
-                        } else {
-                            diff
-                        };
-                        ctx.push_str(&diff);
-                        ctx.push_str("\n```\n\n");
-                    }
+                    ctx.push_str("## Recent Changes\n\n```diff\n");
+                    // Truncate to reasonable size
+                    let diff = if diff.len() > 4000 {
+                        format!("{}...\n(truncated)", &diff[..4000])
+                    } else {
+                        diff
+                    };
+                    ctx.push_str(&diff);
+                    ctx.push_str("\n```\n\n");
                 }
 
                 ctx.push_str("## Instructions\n\n");
@@ -166,38 +164,34 @@ impl FixLoop {
         }
     }
 
-    fn check_risk(&self, attempt: usize) -> bool {
+    fn check_risk(&self, attempt: usize) -> Result<bool> {
         let diff = match ai_tools_core::git_utils::unified_diff(&self.root, &self.since) {
             Some(d) => d,
-            None => return true,
+            None => return Ok(true),
         };
 
         let tmp = std::env::temp_dir().join(format!("cargo-vibe-fix-{attempt}.diff"));
-        if std::fs::write(&tmp, &diff).is_err() {
-            return true;
+        std::fs::write(&tmp, &diff)?;
+        let diff_file = std::fs::File::open(&tmp)?;
+
+        let out = Command::new("diff-risk")
+            .args(["--threshold", &self.risk_threshold.to_string()])
+            .stdin(std::process::Stdio::from(diff_file))
+            .output()
+            .map_err(|e| {
+                anyhow::anyhow!("running diff-risk — required for `cargo vibe fix`: {e}")
+            })?;
+
+        let text = String::from_utf8_lossy(&out.stdout);
+        let err = String::from_utf8_lossy(&out.stderr);
+        if !text.trim().is_empty() {
+            eprintln!("{text}");
+        }
+        if !err.trim().is_empty() {
+            eprintln!("{err}");
         }
 
-        match Command::new("diff-risk")
-            .args(["--threshold", &self.risk_threshold.to_string()])
-            .stdin(std::process::Stdio::from(
-                std::fs::File::open(&tmp).unwrap_or_else(|_| {
-                    panic!("failed to open temp diff file")
-                }),
-            ))
-            .output()
-        {
-            Ok(out) => {
-                let text = String::from_utf8_lossy(&out.stdout);
-                if !text.trim().is_empty() {
-                    eprintln!("{}", text);
-                }
-                out.status.success()
-            }
-            Err(_) => {
-                eprintln!("      diff-risk not available — skipping risk check.");
-                true
-            }
-        }
+        Ok(out.status.success())
     }
 
     fn verify(&self) -> Result<(bool, bool)> {
@@ -255,6 +249,7 @@ pub struct Orchestrator {
     root: PathBuf,
 }
 
+#[allow(dead_code)]
 impl Orchestrator {
     pub fn new(root: &Path) -> Self {
         Self {

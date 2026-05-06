@@ -93,17 +93,20 @@ Run the AI fix loop.
 ## Test commands
 
 ```bash
-# Build only (no tests yet — this is a shell orchestrator)
-cargo build
-
 # Check compilation
-cargo check
+cargo check --locked
 
 # Lint
-cargo clippy --all-targets -- -D warnings
+cargo clippy --all-targets --all-features --locked -- -D warnings
 
 # Format
 cargo fmt --all --check
+
+# Tests
+cargo test --all-features --locked
+
+# Install smoke for internal git-tag releases
+cargo install --path . --locked
 
 # Run with --help to verify CLI parses correctly
 cargo run -- --help
@@ -115,10 +118,10 @@ cargo run -- fix --help
 
 ```bash
 # Debug build
-cargo build
+cargo build --locked
 
 # Release build
-cargo build --release
+cargo build --release --locked
 
 # Run a subcommand (requires tools on PATH)
 cargo run -- check --since HEAD

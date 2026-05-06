@@ -29,17 +29,28 @@ Four tools solve these individually. `cargo-vibecode` packages the `cargo-vibe` 
 
 ## Installation
 
+From a released tag:
+
+```bash
+cargo install --git https://github.com/asmuelle/cargo-vibecode --tag v0.1.0 cargo-vibe
+```
+
+From a local checkout:
+
 ```bash
 cargo install --path .
 ```
 
-Requires the individual tools to be installed:
+For full coverage, install the individual tools:
+
 ```bash
 cargo install cargo-context
 cargo install diff-risk
 cargo install cargo-impact
 cargo install spec-drift
 ```
+
+`cargo vibe check` degrades gracefully when one of the companion tools is absent: it prints a warning and skips that tool. `cargo vibe fix` fails closed if `diff-risk` is unavailable, because the risk veto is the core safety gate for that workflow.
 
 ## Commands
 
@@ -103,6 +114,8 @@ The loop:
 4. Runs `cargo-impact --fail-on high` — surfaces affected tests
 5. Runs `spec-drift --deny warning` — checks for doc/CI drift
 6. If all pass: done. If any fail: feeds failures back for retry (up to `--max-attempts`, default 3)
+
+The generation step is intentionally manual in `v0.1.0`; `cargo-vibe` does not call LLM APIs.
 
 Options:
 ```bash
@@ -178,6 +191,14 @@ enabled = true
 
 Tool-specific config files (`.cargo-context/config.yaml`, `cargo-impact.toml`, `spec-drift.toml`) continue to work independently.
 
+You can also pass an explicit config path:
+
+```bash
+cargo vibe --config ./ci/cargo-vibe.toml check --strict --since origin/main
+```
+
+The top-level config controls orchestration behavior: `enabled = false` skips a tool, `extra_args` are appended to the subprocess invocation, `[diff_risk].threshold` overrides `[vibe].threshold`, and `[vibe].token_budget` is used by `cargo vibe context` when `--budget` is omitted.
+
 ## CI Integration
 
 ### GitHub Actions
@@ -193,6 +214,17 @@ Tool-specific config files (`.cargo-context/config.yaml`, `cargo-impact.toml`, `
   with:
     sarif_file: vibe-results.sarif
 ```
+
+For the `cargo-vibe` repository itself, the internal git-tag release gate is:
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+cargo install --path . --locked
+```
+
+This `v0.1.0` release resolves `ai-tools-core` from the `asmuelle/ai-tools-core` `v0.1.0` git tag. A crates.io release additionally requires publishing `ai-tools-core` to crates.io and changing the dependency to the registry version before running `cargo package` / `cargo publish --dry-run`.
 
 ### Pre-commit Hook
 
@@ -230,6 +262,8 @@ Each tool is independently usable. `cargo-vibecode` adds orchestration, feedback
 | 0 | All checks passed (or no blocking findings) |
 | 1 | Threshold exceeded — findings exist at or above the configured severity |
 | 2 | Tool error — config parse failure, missing dependency, I/O error |
+
+Note: `cargo vibe check` treats missing companion tools as skipped checks, not tool errors. Wrapper commands such as `cargo vibe risk`, `cargo vibe impact`, `cargo vibe drift`, and `cargo vibe context` return code 2 when their required subprocess cannot be started. `cargo vibe fix` also returns code 2 when `diff-risk` is unavailable.
 
 ## Dependencies
 

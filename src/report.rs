@@ -27,10 +27,7 @@ pub struct ToolCounts {
 }
 
 impl AggregatedReport {
-    pub fn new(
-        tool: &str,
-        findings: &[ai_tools_core::finding::Finding],
-    ) -> Self {
+    pub fn new(tool: &str, findings: &[ai_tools_core::finding::Finding]) -> Self {
         let mut counts = SeverityCounts::default();
         let mut tool_counts = ToolCounts::default();
 

@@ -2,9 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -16,25 +18,44 @@ env:
 
 jobs:
   verify:
-    name: Build and test
-    runs-on: ubuntu-latest
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Checkout ai-tools-core
-        uses: actions/checkout@v6
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          repository: asmuelle/ai-tools-core
-          path: ai-tools-core
+          path: cargo-vibecode
 
-      - name: Link ai-tools-core sibling checkout
-        run: ln -sfn "$GITHUB_WORKSPACE/ai-tools-core" "$GITHUB_WORKSPACE/../ai-tools-core"
-
-      - uses: dtolnay/rust-toolchain@master
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.95"
+          toolchain: 1.95.0
+          components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cargo-vibecode
 
-      - run: cargo build --all-features --locked
-      - run: cargo test --all-features --locked
+      - name: Format
+        run: cargo fmt --all --check
+        working-directory: cargo-vibecode
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+        working-directory: cargo-vibecode
+
+      - name: Test
+        run: cargo test --all-features
+        working-directory: cargo-vibecode
+
+      - name: Install smoke
+        run: cargo install --path . --locked
+        working-directory: cargo-vibecode
